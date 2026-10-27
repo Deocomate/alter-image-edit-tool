@@ -1,0 +1,21 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    # Only exposed on the internal network; Coolify's proxy routes the domain to it, so no host port can clash.
+    expose:
+      - "3210"
+    environment:
+      - PORT=3210
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+    volumes:
+      - app-data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3210/').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  app-data:

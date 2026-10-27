@@ -1,0 +1,19 @@
+{
+  "name": "image-edit-ai-tool",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local high-resolution AI image editor powered by OpenRouter image models",
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file=.env server/index.js",
+    "dev": "node --watch --env-file=.env server/index.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "engines": {
+    "node": ">=20.6"
+  },
+  "dependencies": {
+    "express": "^4.22.3",
+    "sharp": "^0.35.5"
+  }
+}

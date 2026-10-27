@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Image Edit AI</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-top">
+        <button class="icon-btn" id="close-sidebar" title="Đóng thanh bên" aria-label="Đóng thanh bên">
+          <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+        </button>
+        <button class="new-btn" id="new-session">
+          <svg viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+          <span>Chỉnh sửa mới</span>
+        </button>
+      </div>
+      <div class="sidebar-label">Lịch sử</div>
+      <nav class="session-list" id="session-list"></nav>
+      <div class="sidebar-foot">Ảnh được lưu trong thư mục <code>data/</code></div>
+    </aside>
+    <div class="backdrop" id="backdrop"></div>
+
+    <main class="main">
+      <header class="topbar">
+        <button class="icon-btn" id="open-sidebar" title="Mở thanh bên" aria-label="Mở thanh bên">
+          <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+        </button>
+        <div class="dropdown" id="model-dropdown">
+          <button class="model-btn" data-toggle>
+            <span id="model-label">Đang tải model…</span>
+            <svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
+          </button>
+          <div class="menu model-menu">
+            <input class="menu-search" id="model-search" placeholder="Tìm model…" />
+            <div class="menu-scroll" id="model-list"></div>
+          </div>
+        </div>
+      </header>
+
+      <section class="thread" id="thread">
+        <div class="empty" id="empty">
+          <h1>Bạn muốn chỉnh sửa ảnh gì?</h1>
+          <p>Ảnh gốc được gửi nguyên chất lượng, kết quả xuất đúng độ phân giải bạn chọn. Dùng <b>cọ vẽ</b> để khoanh vùng cần sửa, phần còn lại giữ nguyên từng pixel.</p>
+        </div>
+        <div class="messages" id="messages"></div>
+      </section>
+
+      <footer class="composer-wrap">
+        <form class="composer" id="composer">
+          <div class="attachments" id="attachments"></div>
+          <div class="presets" id="presets" hidden></div>
+          <textarea id="prompt" rows="1" placeholder="Mô tả thay đổi, ví dụ: thay nền thành bãi biển lúc hoàng hôn"></textarea>
+          <div class="composer-bar">
+            <div class="composer-tools">
+              <button type="button" class="icon-btn round" id="attach-btn" title="Đính kèm ảnh" aria-label="Đính kèm ảnh">
+                <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+              </button>
+              <input type="file" id="file-input" accept="image/*" multiple hidden />
+              <div class="dropdown up" id="aspect-dropdown">
+                <button type="button" class="pill" data-toggle>
+                  <svg viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="12" rx="2"/></svg>
+                  <span data-label></span>
+                </button>
+                <div class="menu" data-options></div>
+              </div>
+              <div class="dropdown up" id="quality-dropdown">
+                <button type="button" class="pill" data-toggle>
+                  <svg viewBox="0 0 24 24"><path d="M4 7V5a1 1 0 0 1 1-1h2M17 4h2a1 1 0 0 1 1 1v2M20 17v2a1 1 0 0 1-1 1h-2M7 20H5a1 1 0 0 1-1-1v-2"/></svg>
+                  <span data-label></span>
+                </button>
+                <div class="menu" data-options></div>
+              </div>
+              <div class="dropdown up" id="format-dropdown">
+                <button type="button" class="pill" data-toggle>
+                  <svg viewBox="0 0 24 24"><path d="M14 3v5h5M6 3h8l5 5v13H6z"/></svg>
+                  <span data-label></span>
+                </button>
+                <div class="menu" data-options></div>
+              </div>
+            </div>
+            <button type="submit" class="send-btn" id="send-btn" title="Gửi" aria-label="Gửi">
+              <svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+            </button>
+          </div>
+        </form>
+        <div class="composer-hint" id="composer-hint"></div>
+      </footer>
+    </main>
+  </div>
+
+  <div class="drop-overlay" id="drop-overlay"><div>Thả ảnh vào đây</div></div>
+
+  <div class="modal" id="lightbox" hidden>
+    <div class="modal-head">
+      <div class="seg" id="lightbox-modes">
+        <button data-mode="result" class="active">Kết quả</button>
+        <button data-mode="compare">So sánh</button>
+      </div>
+      <button class="icon-btn" data-close aria-label="Đóng"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+    </div>
+    <div class="lightbox-body" id="lightbox-body">
+      <div class="compare" id="compare">
+        <img id="compare-after" alt="Kết quả" />
+        <div class="compare-before" id="compare-before-wrap"><img id="compare-before" alt="Ảnh gốc" /></div>
+        <div class="compare-line" id="compare-line"></div>
+        <span class="compare-tag left">Trước</span><span class="compare-tag right">Sau</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal" id="mask-modal" hidden>
+    <div class="modal-head">
+      <div class="seg" id="mask-mode">
+        <button data-mode="edit" class="active">Tô vùng cần sửa</button>
+        <button data-mode="keep">Tô vùng giữ nguyên</button>
+      </div>
+      <div class="mask-tools">
+        <label class="brush">Cọ <input type="range" id="brush-size" min="5" max="300" value="60" /></label>
+        <button class="tool-btn" id="mask-eraser">Tẩy</button>
+        <button class="tool-btn" id="mask-undo">Hoàn tác</button>
+        <button class="tool-btn" id="mask-clear">Xoá hết</button>
+      </div>
+      <div class="mask-actions">
+        <button class="tool-btn" data-close>Huỷ</button>
+        <button class="primary-btn" id="mask-apply">Áp dụng</button>
+      </div>
+    </div>
+    <div class="mask-body">
+      <div class="mask-stage" id="mask-stage">
+        <img id="mask-image" alt="" />
+        <canvas id="mask-canvas"></canvas>
+      </div>
+    </div>
+    <p class="mask-note">Chỉ vùng được tô (hoặc ngoài vùng giữ nguyên) nhận thay đổi từ AI. Phần còn lại là pixel gốc 100%, nên khung hình luôn giữ theo ảnh gốc.</p>
+  </div>
+
+  <div class="modal" id="layout-modal" hidden>
+    <div class="modal-head">
+      <div class="seg" id="layout-ratios"></div>
+      <div class="mask-tools">
+        <label class="brush">Độ lớn <input type="range" id="layout-fill" min="40" max="100" value="80" /> <span id="layout-fill-value"></span></label>
+        <button class="tool-btn" id="layout-center">Căn giữa</button>
+        <span class="layout-size" id="layout-size"></span>
+      </div>
+      <div class="mask-actions">
+        <button class="tool-btn" data-close>Huỷ</button>
+        <button class="primary-btn" id="layout-apply">Áp dụng</button>
+      </div>
+    </div>
+    <div class="mask-body">
+      <canvas class="layout-canvas" id="layout-canvas"></canvas>
+    </div>
+    <p class="mask-note">Kéo để dời bộ đồ thờ, chỉnh "Độ lớn" để thêm hoặc bớt khoảng trống quanh nó. Sản phẩm giữ nguyên kích thước pixel gốc, chỉ khung hình thay đổi, nên không mất chi tiết.</p>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
