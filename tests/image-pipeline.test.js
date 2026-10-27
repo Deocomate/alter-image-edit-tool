@@ -11,6 +11,7 @@ import {
   layoutCutout,
   padToRatio,
   pickResolution,
+  placeOnScene,
   prepareInputImage,
 } from '../server/image-pipeline.js';
 
@@ -278,4 +279,52 @@ test('layout keeps the products inside the frame when the position is pushed pas
   for (let i = 0; i < info.height; i++) rightEdge ||= opaqueAt(info.width - 1, i);
   for (let i = 0; i < info.width; i++) topEdge ||= opaqueAt(i, 0);
   assert.ok(rightEdge && topEdge, 'products should sit against the top-right corner');
+});
+
+test('products placed on an altar photo keep both photos and take only the shadows from the model', async () => {
+  const S = 1000;
+  // An irregular wood-like texture; a repeating pattern would make any shift look like a match.
+  const grain = (x, y) => {
+    const v = Math.sin((x >> 4) * 12.9898 + (y >> 4) * 78.233 + 7) * 43758.5453;
+    return v - Math.floor(v);
+  };
+  const altarRaw = Buffer.alloc(S * S * 3);
+  for (let p = 0; p < S * S; p++) {
+    const [x, y] = [p % S, Math.floor(p / S)];
+    altarRaw[p * 3] = 90 + grain(x, y) * 120;
+    altarRaw[p * 3 + 1] = 60 + grain(x + 500, y) * 80;
+    altarRaw[p * 3 + 2] = 30 + grain(x, y + 500) * 60;
+  }
+  const altar = await sharp(altarRaw, { raw: { width: S, height: S, channels: 3 } }).jpeg({ quality: 95 }).toBuffer();
+  const placed = await placeOnScene(await noisyCutout(1000, 1000), altar, { fill: 0.5, centerX: 0.5, centerY: 0.6 });
+
+  // The products span half the frame on their limiting side, centred at (0.5, 0.6), so the bottom edge is near y = 751.
+  // (Measured from the layer below; the assertion only guards the placement formula.)
+  const { data: alpha, info } = await sharp(placed.layer).extractChannel(3).raw().toBuffer({ resolveWithObject: true });
+  assert.deepEqual([info.width, info.height], [S, S]);
+  let bottom = 0;
+  for (let p = 0; p < S * S; p++) if (alpha[p]) bottom = Math.max(bottom, Math.floor(p / S));
+  assert.ok(Math.abs(bottom - 751) <= 5, `bottom ${bottom}`);
+
+  // A model output: the same picture with a shadow under the products, a slightly darker overall tone, and a small shift.
+  const shadow = await sharp({ create: { width: 500, height: 40, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0.5 } } }).png().toBuffer();
+  const withShadow = await sharp(placed.composite).composite([{ input: shadow, left: 250, top: bottom + 1 }]).linear(0.9, 0).png().toBuffer();
+  // sharp applies extract before extend, so the shifted image must be materialized first.
+  const shifted = await sharp(withShadow).extend({ left: 6, top: 4, extendWith: 'copy' }).png().toBuffer();
+  const generated = await sharp(shifted).extract({ left: 0, top: 0, width: S, height: S }).resize(1024, 1024).png().toBuffer();
+
+  const out = await finalizeImage({ generated, scene: placed, target: { width: S, height: S }, format: 'png' });
+  const px = await sharp(out.buffer).removeAlpha().raw().toBuffer();
+  const scene = await sharp(placed.scene).removeAlpha().raw().toBuffer();
+  const layer = await sharp(placed.layer).raw().toBuffer();
+
+  const at = (buf, x, y, channels = 3) => [...buf.subarray((y * S + x) * channels, (y * S + x) * channels + 3)];
+  assert.deepEqual(at(px, 20, 20), at(scene, 20, 20), 'the altar away from the products is untouched');
+  let changed = 0;
+  for (let p = 0; p < S * S; p++) {
+    if (layer[p * 4 + 3] === 255 && (px[p * 3] !== layer[p * 4] || px[p * 3 + 1] !== layer[p * 4 + 1] || px[p * 3 + 2] !== layer[p * 4 + 2])) changed++;
+  }
+  assert.equal(changed, 0, 'product pixels are pasted unchanged');
+  const lum = ([r, g, b]) => r + g + b;
+  assert.ok(lum(at(px, 400, bottom + 12)) < lum(at(scene, 400, bottom + 12)) * 0.8, 'the model shadow under the products is kept');
 });

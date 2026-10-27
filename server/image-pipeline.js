@@ -91,6 +91,9 @@ const COARSE_EDGE = 128;
 const SCALE_MIN = 700;
 const SCALE_MAX = 1300;
 const MAX_SHIFT = 0.15;
+// Most sampled points per working size; the coarse level runs many more candidates, so it gets fewer.
+const COARSE_POINTS = 4000;
+const FINE_POINTS = 25000;
 
 // Greyscale pixels at a small working size, used to compare the model output with the cutout.
 async function smallGrey(input, width, height) {
@@ -99,7 +102,7 @@ async function smallGrey(input, width, height) {
 
 // Scores a candidate mapping at one working size by the normalized cross-correlation between the cutout's
 // opaque pixels and the model output, so products the model relit still match.
-async function alignmentMatcher(generated, cutout, edge) {
+async function alignmentMatcher(generated, cutout, edge, maxPoints) {
   const meta = await sharp(cutout).metadata();
   const k = edge / Math.max(meta.width, meta.height);
   const w = Math.round(meta.width * k);
@@ -108,11 +111,15 @@ async function alignmentMatcher(generated, cutout, edge) {
   const gen = await smallGrey(generated, w, h);
   const alpha = await sharp(cutout).ensureAlpha().extractChannel(3).resize(w, h, { fit: 'fill' }).raw().toBuffer();
 
+  let opaque = 0;
+  for (let p = 0; p < w * h; p++) if (alpha[p] > 230) opaque++;
+  // An opaque reference (a whole scene photo) is sampled on a sparse grid to keep the search fast.
+  const step = Math.max(1, Math.round(Math.sqrt(opaque / maxPoints)));
   const xs = [];
   const ys = [];
   const refs = [];
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
+  for (let y = 0; y < h; y += step) {
+    for (let x = 0; x < w; x += step) {
       if (alpha[y * w + x] <= 230) continue;
       xs.push(x);
       ys.push(y);
@@ -125,14 +132,22 @@ async function alignmentMatcher(generated, cutout, edge) {
   const refVar = centred.reduce((a, r) => a + r * r, 0);
   const cx = w / 2;
   const cy = h / 2;
+  // Bilinear sampling, so sub-pixel shifts change the score and the fine search can resolve them.
+  const sample = (x, y) => {
+    if (x < 0 || y < 0 || x > w - 1 || y > h - 1) return 0;
+    const x0 = Math.min(Math.floor(x), w - 2);
+    const y0 = Math.min(Math.floor(y), h - 2);
+    const fx = x - x0;
+    const fy = y - y0;
+    const i = y0 * w + x0;
+    return (gen[i] * (1 - fx) + gen[i + 1] * fx) * (1 - fy) + (gen[i + w] * (1 - fx) + gen[i + w + 1] * fx) * fy;
+  };
   const score = (s, dx, dy) => {
     let sg = 0;
     let sgg = 0;
     let srg = 0;
     for (let i = 0; i < n; i++) {
-      const gx = Math.round(cx + s * (xs[i] - cx) + dx);
-      const gy = Math.round(cy + s * (ys[i] - cy) + dy);
-      const g = gx >= 0 && gx < w && gy >= 0 && gy < h ? gen[gy * w + gx] : 0;
+      const g = sample(cx + s * (xs[i] - cx) + dx, cy + s * (ys[i] - cy) + dy);
       sg += g;
       sgg += g * g;
       srg += centred[i] * g;
@@ -149,9 +164,9 @@ const range = (from, to, step) => Array.from({ length: Math.floor((to - from) / 
 // Models often re-compose the scene (for example shrinking the products to fit a square altar), so the search is
 // wide and runs coarse-to-fine. `score` is the correlation of the best match (1 = identical).
 export async function estimateAlignment(generated, cutout) {
-  const coarse = await alignmentMatcher(generated, cutout, COARSE_EDGE);
-  const fine = await alignmentMatcher(generated, cutout, ALIGN_EDGE);
-  if (coarse.n < 50 || fine.n < 200) return { scale: 1, dx: 0, dy: 0, score: null };
+  const coarse = await alignmentMatcher(generated, cutout, COARSE_EDGE, COARSE_POINTS);
+  const fine = await alignmentMatcher(generated, cutout, ALIGN_EDGE, FINE_POINTS);
+  if (coarse.n < 50 || fine.n < 100) return { scale: 1, dx: 0, dy: 0, score: null };
 
   let best = { s: 1000, dx: 0, dy: 0, c: coarse.score(1, 0, 0) };
   const search = (matcher, scales, shiftsX, shiftsY) => {
@@ -175,6 +190,8 @@ export async function estimateAlignment(generated, cutout) {
   search(fine, around(start.s, 20, 5), around(start.dx, 6, 1), around(start.dy, 6, 1));
   const mid = best;
   search(fine, around(mid.s, 4, 2), around(mid.dx, 1, 0.5), around(mid.dy, 1, 0.5));
+  const half = best;
+  search(fine, [half.s], around(half.dx, 0.375, 0.125), around(half.dy, 0.375, 0.125));
   return { scale: best.s / 1000, dx: best.dx / fine.k, dy: best.dy / fine.k, score: best.c };
 }
 
@@ -204,6 +221,104 @@ async function compositeCutout({ generated, cutout }) {
   const background = await sharp(generated).resize(width, height, { fit: 'fill', kernel: 'lanczos3' }).removeAlpha().png().toBuffer();
   const products = await placeCutout(cutout, { width, height }, alignment);
   return { buffer: await sharp(background).composite([{ input: products }]).png().toBuffer(), alignment };
+}
+
+// Resamples the model output so that output(p) = generated(c + scale·(p − c) + d) at the reference size.
+async function alignGenerated(generated, { width, height }, { scale, dx, dy }) {
+  const fitted = await sharp(generated).resize(width, height, { fit: 'fill', kernel: 'lanczos3' }).removeAlpha().png().toBuffer();
+  if (scale === 1 && dx === 0 && dy === 0) return fitted;
+  const sw = Math.round(width / scale);
+  const sh = Math.round(height / scale);
+  const scaled = await sharp(fitted).resize(sw, sh, { fit: 'fill', kernel: 'lanczos3' }).png().toBuffer();
+  const left = Math.round(((1 - scale) * (width / 2) + dx) / scale);
+  const top = Math.round(((1 - scale) * (height / 2) + dy) / scale);
+  const pad = Math.max(Math.abs(left), Math.abs(top)) + Math.max(Math.abs(sw - width), Math.abs(sh - height)) + 2;
+  // sharp applies extract before extend, so the padded image must be materialized first.
+  const padded = await sharp(scaled).extend({ top: pad, bottom: pad, left: pad, right: pad, extendWith: 'copy' }).png().toBuffer();
+  return sharp(padded).extract({ left: left + pad, top: top + pad, width, height }).png().toBuffer();
+}
+
+// Puts the product group on an existing scene photo (for example an empty altar). The group spans `fill` of the
+// scene's limiting side with its centre at (centerX, centerY). Returns the opaque scene, the product layer at scene
+// size, and the flat preview the model edits.
+export async function placeOnScene(cutout, sceneBuffer, { fill = 0.6, centerX = 0.5, centerY = 0.6 } = {}) {
+  const box = await alphaBounds(cutout);
+  if (!box) throw new Error('Ảnh tách nền không có sản phẩm nào');
+  const scene = await sharp(sceneBuffer).removeAlpha().png().toBuffer();
+  const { width, height } = await sharp(scene).metadata();
+  const f = clamp(Number(fill) || 0.6, 0.05, 1);
+  const k = Math.min((f * width) / box.width, (f * height) / box.height);
+  const pw = Math.max(1, Math.round(box.width * k));
+  const ph = Math.max(1, Math.round(box.height * k));
+  const left = Math.round(clamp(Number(centerX) * width - pw / 2, 0, width - pw));
+  const top = Math.round(clamp(Number(centerY) * height - ph / 2, 0, height - ph));
+  let product = sharp(cutout).ensureAlpha().extract(box);
+  if (pw !== box.width || ph !== box.height) product = product.resize(pw, ph, { fit: 'fill', kernel: 'lanczos3' });
+  const layer = await sharp({ create: { width, height, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } })
+    .composite([{ input: await product.png().toBuffer(), left, top }])
+    .png()
+    .toBuffer();
+  const composite = await sharp(scene).composite([{ input: layer }]).png().toBuffer();
+  return { scene, layer, composite };
+}
+
+const ZONE_EDGE = 512;
+// How far around the products the model may change the scene (contact shadows, reflections), as a share of the frame.
+const SHADOW_REACH = 0.05;
+
+// Feathered mask of where the model output is used: the products dilated by SHADOW_REACH. Computed small and scaled up.
+async function shadowZone(layer, width, height) {
+  const k = ZONE_EDGE / Math.max(width, height);
+  const sw = Math.max(1, Math.round(width * k));
+  const sh = Math.max(1, Math.round(height * k));
+  const sigma = (ZONE_EDGE * SHADOW_REACH) / 2;
+  const raw = { raw: { width: sw, height: sh, channels: 1 } };
+  // sharp runs linear before blur within one pipeline, and a single-channel raw input comes back as three channels,
+  // so each step is materialized and channel 0 is taken explicitly.
+  const blurred = await sharp(layer).ensureAlpha().extractChannel(3).resize(sw, sh, { fit: 'fill' }).blur(sigma).extractChannel(0).raw().toBuffer();
+  const dilated = await sharp(blurred, raw).linear(6, 0).extractChannel(0).raw().toBuffer();
+  const feathered = await sharp(dilated, raw).blur(sigma / 2).extractChannel(0).raw().toBuffer();
+  return sharp(feathered, { raw: { width: sw, height: sh, channels: 1 } }).resize(width, height, { fit: 'fill' }).extractChannel(0).raw().toBuffer();
+}
+
+// Scales each colour channel of the model output so that, away from the products, it matches the original scene.
+// Models often shift the overall tone slightly, which would otherwise show as a halo around the shadow zone.
+async function matchColours(aligned, scene, zone, width, height) {
+  const k = 256 / Math.max(width, height);
+  const sw = Math.max(1, Math.round(width * k));
+  const sh = Math.max(1, Math.round(height * k));
+  const a = await sharp(aligned).resize(sw, sh, { fit: 'fill' }).removeAlpha().raw().toBuffer();
+  const s = await sharp(scene).resize(sw, sh, { fit: 'fill' }).removeAlpha().raw().toBuffer();
+  const z = await sharp(zone, { raw: { width, height, channels: 1 } }).resize(sw, sh, { fit: 'fill' }).raw().toBuffer();
+  const sumA = [0, 0, 0];
+  const sumS = [0, 0, 0];
+  let count = 0;
+  for (let p = 0; p < sw * sh; p++) {
+    if (z[p] > 8) continue;
+    count++;
+    for (let c = 0; c < 3; c++) {
+      sumA[c] += a[p * 3 + c];
+      sumS[c] += s[p * 3 + c];
+    }
+  }
+  if (count < 100) return aligned;
+  const gains = sumA.map((v, c) => clamp(v > 0 ? sumS[c] / v : 1, 0.7, 1.4));
+  return sharp(aligned).linear(gains, [0, 0, 0]).png().toBuffer();
+}
+
+// Keeps the scene photo untouched except around the products, where the model's shadows and reflections are blended
+// in, then pastes the product layer exactly where it was placed.
+async function compositeScene({ generated, scene, layer, composite }) {
+  const { width, height } = await sharp(scene).metadata();
+  const alignment = await estimateAlignment(generated, composite);
+  const aligned = await alignGenerated(generated, { width, height }, alignment);
+  const zone = await shadowZone(layer, width, height);
+  const matched = await matchColours(aligned, scene, zone, width, height);
+  // sharp applies joinChannel before other operations, so the colour-matched image must be materialized first.
+  const rgb = await sharp(matched).removeAlpha().png().toBuffer();
+  const zoned = await sharp(rgb).joinChannel(zone, { raw: { width, height, channels: 1 } }).png().toBuffer();
+  const buffer = await sharp(scene).composite([{ input: zoned }, { input: layer }]).png().toBuffer();
+  return { buffer, alignment };
 }
 
 // Widens a cutout frame with transparent margins to exactly `ratio`, so the output of a model that only produces
@@ -304,10 +419,11 @@ async function compositeWithMask({ generated, source, mask, maskMode }) {
   return sharp(source).composite([{ input: genWithAlpha }]).png().toBuffer();
 }
 
-export async function finalizeImage({ generated, source, mask, maskMode, cutout, target, format }) {
+export async function finalizeImage({ generated, source, mask, maskMode, cutout, scene, target, format }) {
   let base = generated;
   let alignment = null;
-  if (cutout) ({ buffer: base, alignment } = await compositeCutout({ generated, cutout: source }));
+  if (scene) ({ buffer: base, alignment } = await compositeScene({ generated, ...scene }));
+  else if (cutout) ({ buffer: base, alignment } = await compositeCutout({ generated, cutout: source }));
   else if (mask) base = await compositeWithMask({ generated, source, mask, maskMode });
   const meta = await sharp(base).metadata();
   const sameSize = meta.width === target.width && meta.height === target.height;

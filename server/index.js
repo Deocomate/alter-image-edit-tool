@@ -14,6 +14,7 @@ import {
   padToRatio,
   parseRatio,
   pickResolution,
+  placeOnScene,
   prepareInputImage,
 } from './image-pipeline.js';
 import {
@@ -54,6 +55,23 @@ function buildCutoutPrompt(userPrompt, imageCount) {
     '- Output a sharp, high-resolution, photorealistic result with no blur, noise, or compression artifacts.',
   ];
   if (imageCount > 1) lines.push('- The other input images are references for the scene (for example a background or style); use them only as the request asks.');
+  return lines.join('\n');
+}
+
+// For products placed on the user's own scene photo the model only adds shadows and reflections around them;
+// the scene outside that zone and the products themselves are restored from the originals afterwards.
+function buildScenePrompt(userPrompt, imageCount) {
+  const lines = [
+    'You are a professional product photographer and retoucher. The FIRST input image is a real photo of an altar with product cutouts already placed on it.',
+    `Requested finish: "${userPrompt}"`,
+    'Strict rules:',
+    '- Make the products look naturally photographed on this altar: add soft contact shadows, ambient occlusion, and subtle reflections where they touch the surface, matching the light direction of the photo.',
+    '- Do not change the altar, the room, or anything else in the photo. Keep its colors, lighting, and details exactly as they are.',
+    '- Do not move, resize, redraw, restyle, add, or remove any product.',
+    '- Keep the same framing and camera angle so the result aligns pixel-for-pixel with the first image. Do not crop, zoom, or add borders.',
+    '- Output a sharp, high-resolution, photorealistic result with no blur, noise, or compression artifacts.',
+  ];
+  if (imageCount > 1) lines.push('- The other input images are references; use them only as the request asks.');
   return lines.join('\n');
 }
 
@@ -118,7 +136,7 @@ app.delete('/api/sessions/:id', route(async (req, res) => {
 
 app.post('/api/sessions/:id/edit', route(async (req, res) => {
   const session = await getSession(req.params.id);
-  const { prompt, model: modelId, imageIds = [], aspectRatio = 'original', quality = '2k', outputFormat = 'png', mask, maskMode = 'edit' } = req.body || {};
+  const { prompt, model: modelId, imageIds = [], aspectRatio = 'original', quality = '2k', outputFormat = 'png', mask, maskMode = 'edit', placement } = req.body || {};
 
   if (!prompt?.trim()) throw new HttpError(400, 'Hãy nhập yêu cầu chỉnh sửa');
   if (!imageIds.length) throw new HttpError(400, 'Hãy đính kèm ít nhất một ảnh cần chỉnh sửa');
@@ -142,6 +160,16 @@ app.post('/api/sessions/:id/edit', route(async (req, res) => {
     maskId = await saveImage(maskBuffer, 'png');
   }
 
+  // A cutout placed on an existing scene photo (for example an empty altar) uses that photo as the frame.
+  const scene = cutout && placement && buffers.length > 1 && !(await isCutout(buffers[1]))
+    ? await placeOnScene(source, buffers[1], placement).catch((error) => {
+        throw new HttpError(400, error.message);
+      })
+    : null;
+  if (scene) ({ width: srcWidth, height: srcHeight } = await sharp(scene.scene).metadata());
+  // The placement as sent to the model, kept so the result can be checked against it after the editor closes.
+  const placementId = scene ? await saveImage(await sharp(scene.composite).jpeg({ quality: 90 }).toBuffer(), 'jpg') : null;
+
   // Masked edits and cutouts are pasted back onto the original, so they must keep the original frame.
   const pasteBack = Boolean(maskBuffer) || cutout;
   const effectiveAspect = pasteBack ? 'original' : aspectRatio;
@@ -151,16 +179,24 @@ app.post('/api/sessions/:id/edit', route(async (req, res) => {
 
   // A cutout frame the model cannot produce exactly gets transparent margins up to the requested ratio,
   // so the model output maps onto the frame with a uniform scale instead of being stretched.
-  if (cutout && requestAspect) {
+  if (cutout && !scene && requestAspect) {
     source = await padToRatio(source, parseRatio(requestAspect));
     ({ width: srcWidth, height: srcHeight } = await sharp(source).metadata());
     target = computeTargetSize({ srcWidth, srcHeight, aspectRatio: 'original', quality });
   }
 
-  const inputs = cutout ? [await flattenCutout(source), ...buffers.slice(1)] : buffers;
+  let inputs = buffers;
+  let modelPrompt = buildPrompt(prompt.trim(), imageIds.length, Boolean(maskBuffer));
+  if (scene) {
+    inputs = [scene.composite, ...buffers.slice(2)];
+    modelPrompt = buildScenePrompt(prompt.trim(), inputs.length);
+  } else if (cutout) {
+    inputs = [await flattenCutout(source), ...buffers.slice(1)];
+    modelPrompt = buildCutoutPrompt(prompt.trim(), imageIds.length);
+  }
   const request = {
     model: model.id,
-    prompt: cutout ? buildCutoutPrompt(prompt.trim(), imageIds.length) : buildPrompt(prompt.trim(), imageIds.length, Boolean(maskBuffer)),
+    prompt: modelPrompt,
     n: 1,
     input_references: (await Promise.all(inputs.map(prepareInputImage))).map((url) => ({ type: 'image_url', image_url: { url } })),
   };
@@ -177,6 +213,9 @@ app.post('/api/sessions/:id/edit', route(async (req, res) => {
     maskId,
     maskMode: maskBuffer ? maskMode : null,
     cutout,
+    scene: Boolean(scene),
+    placementImage: placementId ? await describeImage(placementId) : null,
+    placement: scene ? placement : null,
     params: { model: model.id, aspectRatio: cutout ? requestAspect ?? 'original' : effectiveAspect, quality, outputFormat },
     createdAt: new Date().toISOString(),
   };
@@ -189,13 +228,13 @@ app.post('/api/sessions/:id/edit', route(async (req, res) => {
   try {
     const generated = await generateImage(request);
     const modelOutput = await sharp(generated.buffer).metadata();
-    const result = await finalizeImage({ generated: generated.buffer, source, mask: maskBuffer, maskMode, cutout, target, format: outputFormat });
+    const result = await finalizeImage({ generated: generated.buffer, source, mask: maskBuffer, maskMode, cutout, scene, target, format: outputFormat });
     const id = await saveImage(result.buffer, OUTPUT_FORMATS[outputFormat]);
     assistantMessage = {
       id: randomUUID(),
       role: 'assistant',
       images: [{ id, url: imageUrl(id), width: result.width, height: result.height }],
-      sourceImageId: imageIds[0],
+      sourceImageId: placementId ?? imageIds[0],
       info: {
         model: model.id,
         requestedResolution: request.resolution ?? null,

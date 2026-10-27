@@ -1,5 +1,5 @@
 import { openMaskEditor } from './mask-editor.js';
-import { DEFAULT_LAYOUT, openLayoutEditor } from './layout-editor.js';
+import { DEFAULT_LAYOUT, DEFAULT_PLACEMENT, openLayoutEditor } from './layout-editor.js';
 
 const $ = (id) => document.getElementById(id);
 const DEFAULT_MODEL = 'google/gemini-3-pro-image';
@@ -42,7 +42,20 @@ const SCENE_PRESETS = [
   },
 ];
 
+// Finishes for products placed on the user's own altar photo: the photo stays, so these only steer shadows and light.
+const ALTAR_PHOTO_PRESETS = [
+  {
+    title: 'Đổ bóng tự nhiên',
+    prompt: 'Thêm bóng đổ mềm và vùng tối tiếp xúc dưới chân từng món đồ thờ, đúng hướng ánh sáng của ảnh bàn thờ. Giữ nguyên bàn thờ và đồ thờ.',
+  },
+  {
+    title: 'Phản chiếu mặt gỗ bóng',
+    prompt: 'Thêm bóng đổ mềm dưới chân từng món và phản chiếu nhẹ của đồ thờ trên mặt gỗ bóng của bàn thờ. Giữ nguyên bàn thờ và đồ thờ.',
+  },
+];
+
 const ICONS = {
+  altar: '<svg viewBox="0 0 24 24"><path d="M3 10h18M5 10v10M19 10v10M8 10V7h8v3M10 7V4h4v3"/></svg>',
   check: '<svg class="check" viewBox="0 0 24 24"><path d="M5 12l5 5L20 7"/></svg>',
   close: '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>',
   trash: '<svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>',
@@ -67,6 +80,8 @@ const state = {
   session: null,
   attachments: [], // {id, url, width, height, uploading?}
   mask: null, // {dataUrl, mode, strokes} for attachments[0]
+  sceneMode: true, // a plain photo next to a product cutout is the altar to place the products on
+
   busy: false,
   options: { model: DEFAULT_MODEL, aspectRatio: 'original', quality: '2k', outputFormat: 'png', ...loadOptions() },
 };
@@ -105,6 +120,8 @@ const currentModel = () => state.models.find((m) => m.id === state.options.model
 // A transparent PNG product cutout: the AI only builds the scene and the products are pasted back untouched.
 const isCutoutEdit = () => Boolean(state.attachments[0]?.cutout);
 const keepsOriginalFrame = () => Boolean(state.mask) || isCutoutEdit();
+// Products placed on the user's own altar photo (the second attachment); that photo is the frame and stays untouched.
+const isSceneEdit = () => state.sceneMode && isCutoutEdit() && Boolean(state.attachments[1]) && !state.attachments[1].cutout && !state.attachments[1].uploading;
 
 /* ---------- Dropdowns ---------- */
 
@@ -190,7 +207,7 @@ async function relayout(main, layout) {
 // Choosing a ratio for a product cutout re-frames it, so the model receives exactly that frame.
 function relayoutForAspect() {
   const main = state.attachments[0];
-  if (isCutoutEdit() && main.original && !main.uploading) relayout(main, { ...DEFAULT_LAYOUT, ...main.layout, aspectRatio: cutoutAspect(main.original) });
+  if (isCutoutEdit() && !isSceneEdit() && main.original && !main.uploading) relayout(main, { ...DEFAULT_LAYOUT, ...main.layout, aspectRatio: cutoutAspect(main.original) });
 }
 
 function renderOptions() {
@@ -198,9 +215,9 @@ function renderOptions() {
   if (state.options.aspectRatio !== 'original' && !supported.includes(state.options.aspectRatio)) state.options.aspectRatio = 'original';
   const aspectOptions = ASPECT_OPTIONS.filter((o) => o.value === 'original' || supported.includes(o.value));
   const cutoutRatio = isCutoutEdit() ? state.attachments[0].layout?.aspectRatio : null;
-  const aspectLabel = (o) => (state.mask ? 'Gốc (đang dùng mask)' : cutoutRatio || (o.value === 'original' ? 'Tỉ lệ gốc' : o.title));
+  const aspectLabel = (o) => (state.mask ? 'Gốc (đang dùng mask)' : isSceneEdit() ? 'Theo ảnh bàn thờ' : cutoutRatio || (o.value === 'original' ? 'Tỉ lệ gốc' : o.title));
   renderOptionDropdown('aspect-dropdown', aspectOptions, 'aspectRatio', aspectLabel, relayoutForAspect);
-  $('aspect-dropdown').querySelector('.pill').classList.toggle('locked', Boolean(state.mask));
+  $('aspect-dropdown').querySelector('.pill').classList.toggle('locked', Boolean(state.mask) || isSceneEdit());
   renderOptionDropdown('quality-dropdown', QUALITY_OPTIONS.map((o) => ({ ...o, badge: qualityBadge(o.value) })), 'quality', (o) => o.title);
   renderOptionDropdown('format-dropdown', FORMAT_OPTIONS, 'outputFormat', (o) => o.title);
   renderHint();
@@ -218,16 +235,18 @@ function computeTargetSize(src) {
 }
 
 function renderHint() {
-  const src = state.attachments.find((a) => !a.uploading);
+  const src = isSceneEdit() ? state.attachments[1] : state.attachments.find((a) => !a.uploading);
   const model = currentModel();
   const parts = [];
   if (src) {
     const t = computeTargetSize(src);
-    parts.push(`Ảnh gốc ${src.width}×${src.height} → xuất ${t.width}×${t.height}`);
+    parts.push(`${isSceneEdit() ? 'Ảnh bàn thờ' : 'Ảnh gốc'} ${src.width}×${src.height} → xuất ${t.width}×${t.height}`);
     if (model?.maxNativeEdge && Math.max(t.width, t.height) > model.maxNativeEdge * 1.05) {
       parts.push(`model tạo tối đa ~${model.maxNativeEdge}px, phần còn lại được phóng to`);
     }
-    if (isCutoutEdit()) parts.push('AI chỉ tạo nền và bóng đổ, đồ vật là pixel gốc được ghép vào đúng chỗ model đặt');
+    if (isSceneEdit() && !isPlaced()) parts.push('bước 1: bấm nút khung trên ảnh đồ thờ để đặt và chỉnh cỡ bộ đồ thờ trên mặt bàn thờ');
+    else if (isSceneEdit()) parts.push('đã đặt bộ đồ thờ (bấm nút khung để chỉnh lại); AI sẽ thêm bóng đổ và chiều sâu quanh chân đồ thờ, ảnh bàn thờ giữ nguyên');
+    else if (isCutoutEdit()) parts.push('AI chỉ tạo nền và bóng đổ, đồ vật là pixel gốc được ghép vào đúng chỗ model đặt');
     else if (state.mask) parts.push('chỉ vùng tô được thay đổi');
   } else {
     parts.push('Đính kèm, kéo thả hoặc dán (Ctrl+V) ảnh cần chỉnh sửa');
@@ -338,9 +357,12 @@ const PARAM_LABELS = {
 };
 
 function userMessageHtml(m) {
-  const thumbs = m.images.map((img) => `<img src="${img.url}" alt="" data-view="${img.url}" loading="lazy" />`).join('');
+  const placed = m.placementImage
+    ? `<img src="${m.placementImage.url}" alt="Vị trí đã đặt" title="Vị trí đã đặt (bản gửi cho AI)" data-view="${m.placementImage.url}" loading="lazy" />`
+    : '';
+  const thumbs = m.images.map((img) => `<img src="${img.url}" alt="" data-view="${img.url}" loading="lazy" />`).join('') + placed;
   const p = m.params || {};
-  const params = [PARAM_LABELS.quality(p.quality), PARAM_LABELS.aspect(p.aspectRatio), p.outputFormat?.toUpperCase(), m.maskId ? (m.maskMode === 'keep' ? 'mask giữ nguyên' : 'mask vùng sửa') : null, m.cutout ? 'giữ nguyên sản phẩm' : null].filter(Boolean).join(' · ');
+  const params = [PARAM_LABELS.quality(p.quality), PARAM_LABELS.aspect(p.aspectRatio), p.outputFormat?.toUpperCase(), m.maskId ? (m.maskMode === 'keep' ? 'mask giữ nguyên' : 'mask vùng sửa') : null, m.scene ? 'ghép lên ảnh bàn thờ' : m.cutout ? 'giữ nguyên sản phẩm' : null, m.placement ? `tâm ${Math.round(m.placement.centerX * 100)}%×${Math.round(m.placement.centerY * 100)}%, độ lớn ${Math.round(m.placement.fill * 100)}%` : null].filter(Boolean).join(' · ');
   return `<div class="msg-user">
     <div class="thumbs">${thumbs}</div>
     <div class="bubble">${escapeHtml(m.text)}</div>
@@ -409,8 +431,9 @@ function renderAttachments() {
     .map((a, i) => `<div class="chip${a.uploading ? ' uploading' : ''}">
       <img src="${a.url}" alt="" />
       <button type="button" class="chip-x" data-remove="${i}" aria-label="Bỏ ảnh">${ICONS.close}</button>
-      ${i === 0 ? `<span class="chip-tag">Ảnh sửa</span>` : `<span class="chip-tag">Tham chiếu</span>`}
-      ${i === 0 && !a.uploading && a.original ? `<button type="button" class="chip-brush" data-layout title="Căn bố cục" aria-label="Căn bố cục">${ICONS.layout}</button>` : ''}
+      <span class="chip-tag">${i === 0 ? 'Ảnh sửa' : i === 1 && isSceneEdit() ? 'Bàn thờ' : 'Tham chiếu'}</span>
+      ${i === 0 && !a.uploading && a.original ? `<button type="button" class="chip-brush${isSceneEdit() && !isPlaced() ? ' on' : ''}" data-layout title="${isSceneEdit() ? 'Đặt lên bàn thờ' : 'Căn bố cục'}" aria-label="Căn bố cục">${ICONS.layout}</button>` : ''}
+      ${i === 1 && !a.uploading && !a.cutout && isCutoutEdit() ? `<button type="button" class="chip-brush${state.sceneMode ? ' on' : ''}" data-scene title="${state.sceneMode ? 'Đang dùng làm ảnh bàn thờ (bấm để chỉ dùng làm tham chiếu)' : 'Dùng làm ảnh bàn thờ để ghép đồ thờ lên'}" aria-label="Dùng làm ảnh bàn thờ">${ICONS.altar}</button>` : ''}
       ${i === 0 && !a.uploading && !a.cutout ? `<button type="button" class="chip-brush${state.mask ? ' on' : ''}" data-brush title="Tô vùng cần sửa" aria-label="Tô vùng cần sửa">${ICONS.brush}</button>` : ''}
     </div>`)
     .join('');
@@ -419,14 +442,27 @@ function renderAttachments() {
   updateSendState();
 }
 
+// Whether the user has placed and sized the products on the current altar photo.
+const isPlaced = () => isSceneEdit() && state.attachments[0].placementFor === state.attachments[1].id;
+
+// The user places and sizes the products on the altar photo before anything is generated.
+async function openPlacement() {
+  const [main, scene] = state.attachments;
+  const placement = await openLayoutEditor({ ...main, layout: main.placement ?? DEFAULT_PLACEMENT, scene }).catch((error) => toast(error.message));
+  if (placement) Object.assign(main, { placement, placementFor: scene.id });
+  renderAttachments();
+}
+
+const presetList = () => (isSceneEdit() ? ALTAR_PHOTO_PRESETS : SCENE_PRESETS);
+
 function renderPresets() {
   const box = $('presets');
   box.hidden = !isCutoutEdit();
-  box.innerHTML = SCENE_PRESETS.map((p, i) => `<button type="button" class="preset" data-preset="${i}">${escapeHtml(p.title)}</button>`).join('');
+  box.innerHTML = presetList().map((p, i) => `<button type="button" class="preset" data-preset="${i}">${escapeHtml(p.title)}</button>`).join('');
 }
 
 $('presets').addEventListener('click', (event) => {
-  const preset = SCENE_PRESETS[event.target.closest('[data-preset]')?.dataset.preset];
+  const preset = presetList()[event.target.closest('[data-preset]')?.dataset.preset];
   if (!preset) return;
   promptEl.value = preset.prompt;
   promptEl.dispatchEvent(new Event('input'));
@@ -441,6 +477,13 @@ $('attachments').addEventListener('click', async (event) => {
     if (index === 0) state.mask = null;
     return renderAttachments();
   }
+  if (event.target.closest('[data-scene]')) {
+    state.sceneMode = !state.sceneMode;
+    renderAttachments();
+    if (isSceneEdit() && !isPlaced()) openPlacement();
+    return;
+  }
+  if (event.target.closest('[data-layout]') && isSceneEdit()) return openPlacement();
   if (event.target.closest('[data-layout]')) {
     const main = state.attachments[0];
     const layout = await openLayoutEditor({ ...main, ratios: supportedAspects() });
@@ -495,6 +538,8 @@ async function addFiles(files) {
     renderAttachments();
     setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
   }
+  // A new altar photo opens the placement editor right away: products are placed before anything is generated.
+  if (isSceneEdit() && !isPlaced()) openPlacement();
 }
 
 $('attach-btn').addEventListener('click', () => $('file-input').click());
@@ -553,6 +598,10 @@ $('composer').addEventListener('submit', async (event) => {
   event.preventDefault();
   updateSendState();
   if ($('send-btn').disabled) return;
+  if (isSceneEdit() && !isPlaced()) {
+    toast('Hãy đặt và chỉnh cỡ bộ đồ thờ trên bàn thờ trước khi tạo ảnh');
+    return openPlacement();
+  }
 
   const prompt = promptEl.value.trim();
   const body = {
@@ -564,11 +613,12 @@ $('composer').addEventListener('submit', async (event) => {
     outputFormat: state.options.outputFormat,
     mask: state.mask?.dataUrl,
     maskMode: state.mask?.mode,
+    placement: isSceneEdit() ? state.attachments[0].placement : undefined,
   };
 
   state.busy = true;
   updateSendState();
-  const optimisticUser = userMessageHtml({ text: prompt, images: state.attachments, params: body, maskId: body.mask, maskMode: body.maskMode, cutout: isCutoutEdit() });
+  const optimisticUser = userMessageHtml({ text: prompt, images: state.attachments, params: body, maskId: body.mask, maskMode: body.maskMode, cutout: isCutoutEdit(), placement: body.placement });
   const started = Date.now();
   const pendingHtml = () => `${optimisticUser}<div class="msg-assistant"><div class="pending">Đang chỉnh sửa… ${Math.round((Date.now() - started) / 1000)}s</div></div>`;
   renderThread(pendingHtml());

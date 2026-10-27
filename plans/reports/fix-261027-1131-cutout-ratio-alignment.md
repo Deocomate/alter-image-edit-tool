@@ -41,7 +41,19 @@ Kiểm thử: `npm test` pass 14/14, trong đó có 3 test mới (model thu nh�
 
 Các nhận định về độ "bám bố cục" của từng model chưa được đo. Cách đo khách quan: chạy cùng một cutout và cùng một prompt qua 3–4 model, so sánh điểm "khớp" và scale trong meta. Việc này tốn credit OpenRouter nên cần người dùng đồng ý.
 
+## Bổ sung: ghép lên ảnh bàn thờ có sẵn
+
+Đính kèm ảnh đồ thờ tách nền làm ảnh thứ nhất và ảnh bàn thờ làm ảnh thứ hai; ảnh thứ hai sẽ được gắn nhãn "Bàn thờ". Nút khung trên ảnh đồ thờ mở trình đặt vị trí ngay trên ảnh bàn thờ (kéo để dời, "Độ lớn" từ 10% đến 100%).
+
+Server đặt đồ thờ lên bàn thờ trước (`placeOnScene`), rồi chỉ gửi bản ghép đó cho model kèm prompt "chỉ thêm bóng đổ và phản chiếu" (`buildScenePrompt`). Ở kết quả cuối, pixel ảnh bàn thờ được giữ nguyên trừ một dải mờ khoảng 5% khung quanh đồ thờ. Trong dải đó, ảnh model được căn khớp và chỉnh màu cho khớp với bàn thờ. Đồ thờ được dán đúng vị trí người dùng đặt (`compositeScene`).
+
+Có hai lỗi sharp phát hiện trong lúc làm, cả hai đều đã có test bảo vệ. Thứ nhất, trong cùng một pipeline, `linear` chạy trước `blur`. Thứ hai, ảnh raw 1 kênh sau khi `blur` lại trả về 3 kênh. Ngoài ra, phần căn khớp được nâng lên dùng nội suy bilinear (chính xác dưới 1 pixel) và giới hạn số điểm mẫu để không chậm với ảnh đặc.
+
+Hạn chế: bóng đổ dài vượt quá dải 5% sẽ bị cắt. Nếu tỉ lệ ảnh bàn thờ không nằm trong danh sách model hỗ trợ, ảnh model sẽ bị giãn nhẹ bên trong dải bóng. Với ảnh 1:1 thì không có vấn đề này.
+
 ## Câu hỏi chưa giải quyết
+
+- Dải bóng 5% có đủ cho kiểu ánh sáng bàn thờ thực tế không, hay cần thanh trượt để chỉnh?
 
 - Có chạy benchmark model trả phí (khoảng 4 model × 2 lượt) để chọn model mặc định dựa trên điểm khớp không?
 - Có làm phương án 1 (căn từng món) và/hoặc phương án 2 (best-of-N) không?
