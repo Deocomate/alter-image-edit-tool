@@ -128,7 +128,7 @@ function menuItem({ title, sub, badge, selected, disabled }) {
   </button>`;
 }
 
-function renderOptionDropdown(id, options, key, labelOf) {
+function renderOptionDropdown(id, options, key, labelOf, onChange) {
   const root = $(id);
   const menu = root.querySelector('[data-options]');
   menu.innerHTML = options.map((o) => menuItem({ ...o, selected: o.value === state.options[key] })).join('');
@@ -138,6 +138,7 @@ function renderOptionDropdown(id, options, key, labelOf) {
       saveOptions();
       root.classList.remove('open');
       renderOptions();
+      onChange?.();
     });
   });
   root.querySelector('[data-label]').textContent = labelOf(options.find((o) => o.value === state.options[key]) || options[0]);
@@ -149,11 +150,57 @@ function qualityBadge(value) {
   return QUALITY_TIERS[value] <= max * 1.05 ? '<span class="badge ok">Gốc model</span>' : '<span class="badge">Phóng to</span>';
 }
 
+const parseRatio = (value) => {
+  const [w, h] = String(value).split(':').map(Number);
+  return w / h;
+};
+
+// Ratios the selected model produces natively; any other ratio would come back cropped or stretched.
+function supportedAspects() {
+  const all = ASPECT_OPTIONS.slice(1).map((o) => o.value);
+  const listed = currentModel()?.aspectRatios || [];
+  const supported = all.filter((v) => listed.includes(v));
+  return supported.length ? supported : all;
+}
+
+const closestAspect = (ratio) =>
+  supportedAspects().reduce((best, v) => (Math.abs(Math.log(parseRatio(v) / ratio)) < Math.abs(Math.log(parseRatio(best) / ratio)) ? v : best));
+
+// Frame ratio for a product cutout: the chosen ratio, or the supported ratio closest to the original upload.
+const cutoutAspect = (original) => (state.options.aspectRatio === 'original' ? closestAspect(original.width / original.height) : state.options.aspectRatio);
+
+// Re-frames the original cutout on the server and swaps the attachment for the result.
+async function applyLayout(attachment, layout) {
+  const laid = await api(`/api/images/${attachment.original.id}/layout`, { method: 'POST', body: layout });
+  Object.assign(attachment, laid, { layout });
+}
+
+async function relayout(main, layout) {
+  main.uploading = true;
+  renderAttachments();
+  try {
+    await applyLayout(main, layout);
+  } catch (error) {
+    toast(error.message);
+  }
+  main.uploading = false;
+  renderAttachments();
+}
+
+// Choosing a ratio for a product cutout re-frames it, so the model receives exactly that frame.
+function relayoutForAspect() {
+  const main = state.attachments[0];
+  if (isCutoutEdit() && main.original && !main.uploading) relayout(main, { ...DEFAULT_LAYOUT, ...main.layout, aspectRatio: cutoutAspect(main.original) });
+}
+
 function renderOptions() {
-  const locked = keepsOriginalFrame();
-  const lockedLabel = isCutoutEdit() ? 'Theo bố cục' : 'Gốc (đang dùng mask)';
-  renderOptionDropdown('aspect-dropdown', ASPECT_OPTIONS, 'aspectRatio', (o) => (locked ? lockedLabel : o.value === 'original' ? 'Tỉ lệ gốc' : o.title));
-  $('aspect-dropdown').querySelector('.pill').classList.toggle('locked', locked);
+  const supported = supportedAspects();
+  if (state.options.aspectRatio !== 'original' && !supported.includes(state.options.aspectRatio)) state.options.aspectRatio = 'original';
+  const aspectOptions = ASPECT_OPTIONS.filter((o) => o.value === 'original' || supported.includes(o.value));
+  const cutoutRatio = isCutoutEdit() ? state.attachments[0].layout?.aspectRatio : null;
+  const aspectLabel = (o) => (state.mask ? 'Gốc (đang dùng mask)' : cutoutRatio || (o.value === 'original' ? 'Tỉ lệ gốc' : o.title));
+  renderOptionDropdown('aspect-dropdown', aspectOptions, 'aspectRatio', aspectLabel, relayoutForAspect);
+  $('aspect-dropdown').querySelector('.pill').classList.toggle('locked', Boolean(state.mask));
   renderOptionDropdown('quality-dropdown', QUALITY_OPTIONS.map((o) => ({ ...o, badge: qualityBadge(o.value) })), 'quality', (o) => o.title);
   renderOptionDropdown('format-dropdown', FORMAT_OPTIONS, 'outputFormat', (o) => o.title);
   renderHint();
@@ -180,7 +227,7 @@ function renderHint() {
     if (model?.maxNativeEdge && Math.max(t.width, t.height) > model.maxNativeEdge * 1.05) {
       parts.push(`model tạo tối đa ~${model.maxNativeEdge}px, phần còn lại được phóng to`);
     }
-    if (isCutoutEdit()) parts.push('ảnh tách nền đã căn giữa, đồ vật giữ nguyên 100% pixel gốc, AI chỉ tạo nền và bóng đổ');
+    if (isCutoutEdit()) parts.push('AI chỉ tạo nền và bóng đổ, đồ vật là pixel gốc được ghép vào đúng chỗ model đặt');
     else if (state.mask) parts.push('chỉ vùng tô được thay đổi');
   } else {
     parts.push('Đính kèm, kéo thả hoặc dán (Ctrl+V) ảnh cần chỉnh sửa');
@@ -310,6 +357,9 @@ function assistantMessageHtml(m) {
     `${img.width}×${img.height}`,
     info.modelOutputWidth ? `model tạo ${info.modelOutputWidth}×${info.modelOutputHeight}` : null,
     modelName,
+    info.alignment?.score != null
+      ? `khớp ${Math.round(info.alignment.score * 100)}%${Math.abs(info.alignment.scale - 1) >= 0.02 ? `, sản phẩm ×${info.alignment.scale.toFixed(2)}` : ''}`
+      : null,
     info.cost != null ? `$${Number(info.cost).toFixed(3)}` : null,
     info.durationMs ? `${Math.round(info.durationMs / 1000)}s` : null,
   ].filter(Boolean);
@@ -383,12 +433,6 @@ $('presets').addEventListener('click', (event) => {
   promptEl.focus();
 });
 
-// Re-frames the original cutout on the server and swaps the attachment for the result.
-async function applyLayout(attachment, layout) {
-  const laid = await api(`/api/images/${attachment.original.id}/layout`, { method: 'POST', body: layout });
-  Object.assign(attachment, laid, { layout });
-}
-
 $('attachments').addEventListener('click', async (event) => {
   const remove = event.target.closest('[data-remove]');
   if (remove) {
@@ -399,17 +443,11 @@ $('attachments').addEventListener('click', async (event) => {
   }
   if (event.target.closest('[data-layout]')) {
     const main = state.attachments[0];
-    const layout = await openLayoutEditor(main);
+    const layout = await openLayoutEditor({ ...main, ratios: supportedAspects() });
     if (!layout) return;
-    main.uploading = true;
-    renderAttachments();
-    try {
-      await applyLayout(main, layout);
-    } catch (error) {
-      toast(error.message);
-    }
-    main.uploading = false;
-    return renderAttachments();
+    state.options.aspectRatio = layout.aspectRatio;
+    saveOptions();
+    return relayout(main, layout);
   }
   if (event.target.closest('[data-brush]')) {
     const main = state.attachments[0];
@@ -447,7 +485,7 @@ async function addFiles(files) {
       // The main product cutout is centred in the frame right away; the original is kept for later re-layouts.
       if (uploaded.cutout && state.attachments[0] === placeholder) {
         Object.assign(placeholder, uploaded, { original: { ...uploaded } });
-        await applyLayout(placeholder, { aspectRatio: `${uploaded.width}:${uploaded.height}`, ...DEFAULT_LAYOUT }).catch((error) => toast(error.message));
+        await applyLayout(placeholder, { aspectRatio: cutoutAspect(uploaded), ...DEFAULT_LAYOUT }).catch((error) => toast(error.message));
       }
       Object.assign(placeholder, placeholder.original ? {} : uploaded, { uploading: false });
     } catch (error) {

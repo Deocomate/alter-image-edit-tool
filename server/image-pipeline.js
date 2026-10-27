@@ -86,83 +86,140 @@ export async function flattenCutout(buffer) {
 }
 
 const ALIGN_EDGE = 384;
+const COARSE_EDGE = 128;
+// Search range for where the model redrew the products: scale in per-mille, shift as a share of the frame.
+const SCALE_MIN = 700;
+const SCALE_MAX = 1300;
+const MAX_SHIFT = 0.15;
 
 // Greyscale pixels at a small working size, used to compare the model output with the cutout.
 async function smallGrey(input, width, height) {
   return sharp(input).resize(width, height, { fit: 'fill' }).greyscale().raw().toBuffer();
 }
 
-// Finds the scale and shift that best map the model's redrawn products back onto the cutout.
-// Models usually keep framing, but small drifts would leave ghost edges around pasted products.
-export async function estimateAlignment(generated, cutout) {
+// Scores a candidate mapping at one working size by the normalized cross-correlation between the cutout's
+// opaque pixels and the model output, so products the model relit still match.
+async function alignmentMatcher(generated, cutout, edge) {
   const meta = await sharp(cutout).metadata();
-  const k = ALIGN_EDGE / Math.max(meta.width, meta.height);
+  const k = edge / Math.max(meta.width, meta.height);
   const w = Math.round(meta.width * k);
   const h = Math.round(meta.height * k);
   const ref = await smallGrey(await flattenCutout(cutout), w, h);
   const gen = await smallGrey(generated, w, h);
   const alpha = await sharp(cutout).ensureAlpha().extractChannel(3).resize(w, h, { fit: 'fill' }).raw().toBuffer();
 
-  const points = [];
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (alpha[y * w + x] > 230) points.push(x, y);
-  if (points.length < 200) return { scale: 1, dx: 0, dy: 0 };
-
+  const xs = [];
+  const ys = [];
+  const refs = [];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (alpha[y * w + x] <= 230) continue;
+      xs.push(x);
+      ys.push(y);
+      refs.push(ref[y * w + x]);
+    }
+  }
+  const n = xs.length;
+  const mean = refs.reduce((a, b) => a + b, 0) / (n || 1);
+  const centred = refs.map((r) => r - mean);
+  const refVar = centred.reduce((a, r) => a + r * r, 0);
   const cx = w / 2;
   const cy = h / 2;
-  const cost = (s, dx, dy) => {
-    let sum = 0;
-    for (let i = 0; i < points.length; i += 2) {
-      const gx = Math.round(cx + s * (points[i] - cx) + dx);
-      const gy = Math.round(cy + s * (points[i + 1] - cy) + dy);
+  const score = (s, dx, dy) => {
+    let sg = 0;
+    let sgg = 0;
+    let srg = 0;
+    for (let i = 0; i < n; i++) {
+      const gx = Math.round(cx + s * (xs[i] - cx) + dx);
+      const gy = Math.round(cy + s * (ys[i] - cy) + dy);
       const g = gx >= 0 && gx < w && gy >= 0 && gy < h ? gen[gy * w + gx] : 0;
-      sum += Math.abs(g - ref[points[i + 1] * w + points[i]]);
+      sg += g;
+      sgg += g * g;
+      srg += centred[i] * g;
     }
-    return sum;
+    const genVar = sgg - (sg * sg) / n;
+    return genVar > 0 && refVar > 0 ? srg / Math.sqrt(refVar * genVar) : -1;
   };
-
-  const maxShift = Math.round(w * 0.04);
-  let best = { s: 1, dx: 0, dy: 0, c: cost(1, 0, 0) };
-  for (let s = 0.94; s <= 1.0601; s += 0.02) {
-    for (let dy = -maxShift; dy <= maxShift; dy += 2) {
-      for (let dx = -maxShift; dx <= maxShift; dx += 2) {
-        const c = cost(s, dx, dy);
-        if (c < best.c) best = { s, dx, dy, c };
-      }
-    }
-  }
-  const coarse = best;
-  for (let s = coarse.s - 0.015; s <= coarse.s + 0.0151; s += 0.005) {
-    for (let dy = coarse.dy - 1.5; dy <= coarse.dy + 1.5; dy += 0.5) {
-      for (let dx = coarse.dx - 1.5; dx <= coarse.dx + 1.5; dx += 0.5) {
-        const c = cost(s, dx, dy);
-        if (c < best.c) best = { s, dx, dy, c };
-      }
-    }
-  }
-  return { scale: best.s, dx: best.dx / k, dy: best.dy / k };
+  return { k, w, n, score };
 }
 
-// Resamples the model output so that output(p) = generated(c + scale·(p − c) + d) at the cutout size.
-async function alignGenerated(generated, { width, height }, { scale, dx, dy }) {
-  const fitted = await sharp(generated).resize(width, height, { fit: 'fill', kernel: 'lanczos3' }).removeAlpha().png().toBuffer();
-  if (scale === 1 && dx === 0 && dy === 0) return fitted;
-  const sw = Math.round(width / scale);
-  const sh = Math.round(height / scale);
-  const scaled = await sharp(fitted).resize(sw, sh, { fit: 'fill', kernel: 'lanczos3' }).png().toBuffer();
-  const left = Math.round(((1 - scale) * (width / 2) + dx) / scale);
-  const top = Math.round(((1 - scale) * (height / 2) + dy) / scale);
+const range = (from, to, step) => Array.from({ length: Math.floor((to - from) / step + 1e-9) + 1 }, (_, i) => from + i * step);
+
+// Finds where the model redrew the products: the scale and shift with generated(c + scale·(p − c) + d) ≈ cutout(p).
+// Models often re-compose the scene (for example shrinking the products to fit a square altar), so the search is
+// wide and runs coarse-to-fine. `score` is the correlation of the best match (1 = identical).
+export async function estimateAlignment(generated, cutout) {
+  const coarse = await alignmentMatcher(generated, cutout, COARSE_EDGE);
+  const fine = await alignmentMatcher(generated, cutout, ALIGN_EDGE);
+  if (coarse.n < 50 || fine.n < 200) return { scale: 1, dx: 0, dy: 0, score: null };
+
+  let best = { s: 1000, dx: 0, dy: 0, c: coarse.score(1, 0, 0) };
+  const search = (matcher, scales, shiftsX, shiftsY) => {
+    for (const s of scales) {
+      for (const dy of shiftsY) {
+        for (const dx of shiftsX) {
+          const c = matcher.score(s / 1000, dx, dy);
+          if (c > best.c) best = { s, dx, dy, c };
+        }
+      }
+    }
+  };
+  const around = (centre, radius, step) => range(centre - radius, centre + radius, step);
+
+  const maxShift = Math.round(coarse.w * MAX_SHIFT);
+  search(coarse, range(SCALE_MIN, SCALE_MAX, 20), range(-maxShift, maxShift, 2), range(-maxShift, maxShift, 2));
+
+  const up = fine.k / coarse.k;
+  const start = { s: best.s, dx: Math.round(best.dx * up), dy: Math.round(best.dy * up) };
+  best = { ...start, c: fine.score(start.s / 1000, start.dx, start.dy) };
+  search(fine, around(start.s, 20, 5), around(start.dx, 6, 1), around(start.dy, 6, 1));
+  const mid = best;
+  search(fine, around(mid.s, 4, 2), around(mid.dx, 1, 0.5), around(mid.dy, 1, 0.5));
+  return { scale: best.s / 1000, dx: best.dx / fine.k, dy: best.dy / fine.k, score: best.c };
+}
+
+// Moves the cutout onto the products the model drew, so the pasted products sit on the model's own surface and
+// shadows. Products are resampled only when the model changed their size; a pure shift keeps every pixel.
+async function placeCutout(cutout, { width, height }, { scale, dx, dy }) {
+  const sw = Math.round(width * scale);
+  const sh = Math.round(height * scale);
+  const left = Math.round(((1 - scale) * width) / 2 + dx);
+  const top = Math.round(((1 - scale) * height) / 2 + dy);
+  let layer = sharp(cutout).ensureAlpha();
+  if (sw !== width || sh !== height) layer = sharp(await layer.resize(sw, sh, { fit: 'fill', kernel: 'lanczos3' }).png().toBuffer());
   const pad = Math.max(Math.abs(left), Math.abs(top)) + Math.max(Math.abs(sw - width), Math.abs(sh - height)) + 2;
-  // sharp applies extract before extend, so the padded image must be materialized first.
-  const padded = await sharp(scaled).extend({ top: pad, bottom: pad, left: pad, right: pad, extendWith: 'copy' }).png().toBuffer();
-  return sharp(padded).extract({ left: left + pad, top: top + pad, width, height }).png().toBuffer();
+  // sharp applies extract before extend, so the padded layer must be materialized first.
+  const padded = await layer
+    .extend({ top: pad, bottom: pad, left: pad, right: pad, background: { r: 0, g: 0, b: 0, alpha: 0 } })
+    .png()
+    .toBuffer();
+  return sharp(padded).extract({ left: pad - left, top: pad - top, width, height }).png().toBuffer();
 }
 
-// Uses the model output only as background, floor and shadows; the products are the cutout's own pixels.
+// Uses the model output as the whole scene (surface, background, shadows) and pastes the cutout's own product
+// pixels where the model placed the products.
 async function compositeCutout({ generated, cutout }) {
   const { width, height } = await sharp(cutout).metadata();
   const alignment = await estimateAlignment(generated, cutout);
-  const background = await alignGenerated(generated, { width, height }, alignment);
-  return sharp(background).composite([{ input: await sharp(cutout).ensureAlpha().png().toBuffer() }]).png().toBuffer();
+  const background = await sharp(generated).resize(width, height, { fit: 'fill', kernel: 'lanczos3' }).removeAlpha().png().toBuffer();
+  const products = await placeCutout(cutout, { width, height }, alignment);
+  return { buffer: await sharp(background).composite([{ input: products }]).png().toBuffer(), alignment };
+}
+
+// Widens a cutout frame with transparent margins to exactly `ratio`, so the output of a model that only produces
+// fixed ratios scales onto the frame uniformly instead of being stretched.
+export async function padToRatio(buffer, ratio) {
+  const { width, height } = await sharp(buffer).metadata();
+  if (Math.abs(Math.log(width / height / ratio)) < 0.005) return buffer;
+  const w = width / height < ratio ? Math.round(height * ratio) : width;
+  const h = width / height < ratio ? height : Math.round(width / ratio);
+  const left = Math.floor((w - width) / 2);
+  const top = Math.floor((h - height) / 2);
+  return sharp(buffer)
+    .ensureAlpha()
+    .extend({ left, right: w - width - left, top, bottom: h - height - top, background: { r: 0, g: 0, b: 0, alpha: 0 } })
+    .png()
+    .toBuffer();
 }
 
 // Bounding box of the visible (non-transparent) pixels of a cutout, or null when it is empty.
@@ -249,7 +306,8 @@ async function compositeWithMask({ generated, source, mask, maskMode }) {
 
 export async function finalizeImage({ generated, source, mask, maskMode, cutout, target, format }) {
   let base = generated;
-  if (cutout) base = await compositeCutout({ generated, cutout: source });
+  let alignment = null;
+  if (cutout) ({ buffer: base, alignment } = await compositeCutout({ generated, cutout: source }));
   else if (mask) base = await compositeWithMask({ generated, source, mask, maskMode });
   const meta = await sharp(base).metadata();
   const sameSize = meta.width === target.width && meta.height === target.height;
@@ -259,5 +317,5 @@ export async function finalizeImage({ generated, source, mask, maskMode, cutout,
     if (target.width / meta.width > 1.05) pipeline = pipeline.sharpen({ sigma: 0.6 });
   }
   const { data, info } = await encode(pipeline, format).toBuffer({ resolveWithObject: true });
-  return { buffer: data, width: info.width, height: info.height };
+  return { buffer: data, width: info.width, height: info.height, alignment };
 }

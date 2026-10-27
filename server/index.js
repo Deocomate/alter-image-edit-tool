@@ -11,6 +11,8 @@ import {
   isCutout,
   layoutCutout,
   normalizeUpload,
+  padToRatio,
+  parseRatio,
   pickResolution,
   prepareInputImage,
 } from './image-pipeline.js';
@@ -44,6 +46,8 @@ function buildCutoutPrompt(userPrompt, imageCount) {
     'Strict rules:',
     '- Replace ONLY the plain grey backdrop with a photorealistic scene: a surface the products stand on and a background with natural depth (soft depth of field, realistic perspective and lighting).',
     '- Every product must stay at exactly the same position, size, and angle in the frame. Do not move, resize, re-arrange, crop, add, or remove any product.',
+    '- The products already have the right size for the scene: build the surface and the room around them at that scale, without zooming in or out.',
+    '- Fill the whole frame edge to edge with the scene. Leave no grey, borders, or letterboxing.',
     '- Do not redraw or restyle the products. Keep their shapes, patterns, colors, and outlines exactly as they are.',
     '- Ground each product on the surface with soft, realistic contact shadows and cast shadows that match the scene lighting.',
     '- Keep the same framing and camera angle so the result aligns pixel-for-pixel with the first image.',
@@ -124,8 +128,8 @@ app.post('/api/sessions/:id/edit', route(async (req, res) => {
   if (imageIds.length > model.maxReferences) throw new HttpError(400, `Model này nhận tối đa ${model.maxReferences} ảnh`);
 
   const buffers = await Promise.all(imageIds.map(readImage));
-  const source = buffers[0];
-  const { width: srcWidth, height: srcHeight } = await sharp(source).metadata();
+  let source = buffers[0];
+  let { width: srcWidth, height: srcHeight } = await sharp(source).metadata();
 
   // A transparent cutout keeps its own product pixels, so the brush mask does not apply to it.
   const cutout = await isCutout(source);
@@ -141,7 +145,17 @@ app.post('/api/sessions/:id/edit', route(async (req, res) => {
   // Masked edits and cutouts are pasted back onto the original, so they must keep the original frame.
   const pasteBack = Boolean(maskBuffer) || cutout;
   const effectiveAspect = pasteBack ? 'original' : aspectRatio;
-  const target = computeTargetSize({ srcWidth, srcHeight, aspectRatio: effectiveAspect, quality });
+  let target = computeTargetSize({ srcWidth, srcHeight, aspectRatio: effectiveAspect, quality });
+  const requestRatio = pasteBack ? srcWidth / srcHeight : target.width / target.height;
+  const requestAspect = model.aspectRatios.length ? closestAspectRatio(model.aspectRatios, requestRatio) : null;
+
+  // A cutout frame the model cannot produce exactly gets transparent margins up to the requested ratio,
+  // so the model output maps onto the frame with a uniform scale instead of being stretched.
+  if (cutout && requestAspect) {
+    source = await padToRatio(source, parseRatio(requestAspect));
+    ({ width: srcWidth, height: srcHeight } = await sharp(source).metadata());
+    target = computeTargetSize({ srcWidth, srcHeight, aspectRatio: 'original', quality });
+  }
 
   const inputs = cutout ? [await flattenCutout(source), ...buffers.slice(1)] : buffers;
   const request = {
@@ -150,8 +164,7 @@ app.post('/api/sessions/:id/edit', route(async (req, res) => {
     n: 1,
     input_references: (await Promise.all(inputs.map(prepareInputImage))).map((url) => ({ type: 'image_url', image_url: { url } })),
   };
-  const requestRatio = pasteBack ? srcWidth / srcHeight : target.width / target.height;
-  if (model.aspectRatios.length) request.aspect_ratio = closestAspectRatio(model.aspectRatios, requestRatio);
+  if (requestAspect) request.aspect_ratio = requestAspect;
   if (model.resolutions.length) request.resolution = pickResolution(model.resolutions, Math.max(target.width, target.height));
   if (model.qualities.includes('high')) request.quality = 'high';
   if (model.outputFormats.includes('png')) request.output_format = 'png';
@@ -164,7 +177,7 @@ app.post('/api/sessions/:id/edit', route(async (req, res) => {
     maskId,
     maskMode: maskBuffer ? maskMode : null,
     cutout,
-    params: { model: model.id, aspectRatio: effectiveAspect, quality, outputFormat },
+    params: { model: model.id, aspectRatio: cutout ? requestAspect ?? 'original' : effectiveAspect, quality, outputFormat },
     createdAt: new Date().toISOString(),
   };
   session.messages.push(userMessage);
@@ -191,6 +204,7 @@ app.post('/api/sessions/:id/edit', route(async (req, res) => {
         modelOutputHeight: modelOutput.height,
         masked: Boolean(maskBuffer),
         cutout,
+        alignment: result.alignment,
         cost: generated.cost,
         durationMs: Date.now() - startedAt,
       },

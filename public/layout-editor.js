@@ -2,7 +2,6 @@
 // The preview mirrors `layoutCutout` on the server, which applies the result on the full-resolution original.
 const PREVIEW_EDGE = 1400;
 const SCAN_EDGE = 1024;
-const RATIOS = ['3:2', '4:3', '16:9', '1:1', '4:5', '9:16'];
 
 export const DEFAULT_LAYOUT = { fill: 0.8, centerX: 0.5, centerY: 0.5 };
 
@@ -143,15 +142,13 @@ const loadImage = (url) =>
     img.src = url;
   });
 
-// Opens the editor for an original cutout. Resolves to {aspectRatio, fill, centerX, centerY} or undefined (cancelled).
-export async function openLayoutEditor({ original, layout: current }) {
+// Opens the editor for an original cutout with the frame ratios the model supports.
+// Resolves to {aspectRatio, fill, centerX, centerY} or undefined (cancelled).
+export async function openLayoutEditor({ original, layout: current, ratios: supported }) {
   image = await loadImage(original.url);
   bounds = scanBounds(image);
-  const originalRatio = `${original.width}:${original.height}`;
-  const ratios = RATIOS.includes(current.aspectRatio) ? RATIOS : [current.aspectRatio, ...RATIOS];
-  ratioBox.innerHTML = ratios
-    .map((r) => `<button type="button" data-ratio="${r}">${r === originalRatio ? 'Gốc' : r}</button>`)
-    .join('');
+  const ratios = supported.includes(current.aspectRatio) ? supported : [current.aspectRatio, ...supported];
+  ratioBox.innerHTML = ratios.map((r) => `<button type="button" data-ratio="${r}">${r}</button>`).join('');
   layout = { ...current };
   render();
   modal.hidden = false;

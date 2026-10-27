@@ -9,6 +9,7 @@ import {
   flattenCutout,
   isCutout,
   layoutCutout,
+  padToRatio,
   pickResolution,
   prepareInputImage,
 } from '../server/image-pipeline.js';
@@ -146,20 +147,102 @@ test('alignment recovers a small drift of the redrawn products', async () => {
   assert.ok(Math.abs(dy + 12) <= 3, `dy ${dy}`);
 });
 
-test('cutout edit keeps every product pixel identical and replaces only the background', async () => {
+test('cutout edit pastes every product pixel unchanged where the model drew the products', async () => {
   const { raw, png } = await productCutout();
   const generated = await sharp(await shiftedScene(png, 10, 6)).resize(768, 512).png().toBuffer();
   const out = await finalizeImage({ generated, source: png, cutout: true, target: { width: W, height: H }, format: 'png' });
   assert.deepEqual([out.width, out.height], [W, H]);
+  const { scale, dx, dy } = out.alignment;
+  assert.equal(scale, 1);
+  const [sx, sy] = [Math.round(dx), Math.round(dy)];
+  assert.ok(Math.abs(sx - 10) <= 2 && Math.abs(sy - 6) <= 2, `shift ${sx},${sy}`);
   const px = await sharp(out.buffer).removeAlpha().raw().toBuffer();
   let changed = 0;
-  for (let p = 0; p < W * H; p++) {
-    if (raw[p * 4 + 3] !== 255) continue;
-    if (px[p * 3] !== raw[p * 4] || px[p * 3 + 1] !== raw[p * 4 + 1] || px[p * 3 + 2] !== raw[p * 4 + 2]) changed++;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const p = y * W + x;
+      const o = ((y + sy) * W + x + sx) * 3;
+      if (raw[p * 4 + 3] !== 255) continue;
+      if (px[o] !== raw[p * 4] || px[o + 1] !== raw[p * 4 + 1] || px[o + 2] !== raw[p * 4 + 2]) changed++;
+    }
   }
   assert.equal(changed, 0);
   const corner = (20 * W + 20) * 3;
   assert.deepEqual([px[corner], px[corner + 1], px[corner + 2]], [0x5a, 0x3a, 0x22]);
+});
+
+// Products with an irregular, non-repeating surface, like real photographed items.
+async function noisyCutout(width, height) {
+  const raw = Buffer.alloc(width * height * 4);
+  const noise = (x, y) => {
+    const n = Math.sin((x >> 3) * 12.9898 + (y >> 3) * 78.233) * 43758.5453;
+    return n - Math.floor(n);
+  };
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const inside = (x > 250 && x < 520 && y > 300 && y < 720) || Math.hypot(x - 780, y - 560) < 150;
+      if (!inside) continue;
+      const i = (y * width + x) * 4;
+      raw[i] = 40 + noise(x, y) * 200;
+      raw[i + 1] = 30 + noise(x + 999, y) * 180;
+      raw[i + 2] = 20 + noise(x, y + 999) * 120;
+      raw[i + 3] = 255;
+    }
+  }
+  return sharp(raw, { raw: { width, height, channels: 4 } }).png().toBuffer();
+}
+
+// What a model returns when it re-composes the scene: the products redrawn smaller or larger and moved.
+async function rescaledScene(cutout, width, height, scale, dx, dy) {
+  const sw = Math.round(width * scale);
+  const sh = Math.round(height * scale);
+  const pad = 400;
+  const products = await sharp(cutout).resize(sw, sh).modulate({ brightness: 1.1 }).png().toBuffer();
+  const scene = await sharp({ create: { width: width + 2 * pad, height: height + 2 * pad, channels: 3, background: '#5a3a22' } })
+    .composite([{ input: products, left: pad + Math.round((width - sw) / 2) + dx, top: pad + Math.round((height - sh) / 2) + dy }])
+    .png()
+    .toBuffer();
+  return sharp(scene).extract({ left: pad, top: pad, width, height }).png().toBuffer();
+}
+
+test('alignment finds products the model shrank or enlarged well beyond a small drift', async () => {
+  const cutout = await noisyCutout(1000, 1000);
+  for (const [scale, dx, dy] of [[0.78, -25, 60], [1.18, 20, -30]]) {
+    const generated = await sharp(await rescaledScene(cutout, 1000, 1000, scale, dx, dy)).resize(1024, 1024).png().toBuffer();
+    const found = await estimateAlignment(generated, cutout);
+    assert.ok(Math.abs(found.scale - scale) <= 0.01, `scale ${found.scale} vs ${scale}`);
+    assert.ok(Math.abs(found.dx - dx) <= 4 && Math.abs(found.dy - dy) <= 4, `shift ${found.dx},${found.dy} vs ${dx},${dy}`);
+    assert.ok(found.score > 0.8, `score ${found.score}`);
+  }
+});
+
+test('cutout edit follows the model when it shrinks the products, leaving no original-size ghost', async () => {
+  const cutout = await noisyCutout(1000, 1000);
+  const generated = await rescaledScene(cutout, 1000, 1000, 0.8, 0, 40);
+  const out = await finalizeImage({ generated, source: cutout, cutout: true, target: { width: 1000, height: 1000 }, format: 'png' });
+  const px = await sharp(out.buffer).removeAlpha().raw().toBuffer();
+  // The top-left corner of the large product at its original size is now open background.
+  const o = (305 * 1000 + 255) * 3;
+  assert.deepEqual([px[o], px[o + 1], px[o + 2]], [0x5a, 0x3a, 0x22]);
+});
+
+test('padding a cutout to a model ratio keeps the products and makes the ratio exact', async () => {
+  const cutout = await noisyCutout(1000, 800);
+  const padded = await padToRatio(cutout, 4 / 3);
+  const meta = await sharp(padded).metadata();
+  assert.deepEqual([meta.width, meta.height], [1067, 800]);
+  assert.equal(await padToRatio(cutout, 5 / 4), cutout);
+  const original = await sharp(cutout).raw().toBuffer();
+  const out = await sharp(padded).raw().toBuffer();
+  let changed = 0;
+  for (let y = 0; y < 800; y++) {
+    for (let x = 0; x < 1000; x++) {
+      const i = (y * 1000 + x) * 4;
+      const j = (y * 1067 + x + 33) * 4;
+      if (original[i + 3] && original.readUInt32LE(i) !== out.readUInt32LE(j)) changed++;
+    }
+  }
+  assert.equal(changed, 0);
 });
 
 test('layout centres the products in the chosen frame without resampling them', async () => {
